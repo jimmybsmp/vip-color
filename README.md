@@ -3,9 +3,10 @@
 Consistent skin-tone colour correction for a recurring portrait subject,
 working from Nikon RAW files and writing Adobe Camera Raw XMP sidecars.
 
-**Status: Phases 1–2 complete** — RAW decode, skin sampling, and the reference
-profile builder. Phases 3–7 (WB solver, XMP writer, Photoshop launch,
-match-this-shot, batch reporting) are not built yet.
+**Status: Phases 1–3 complete** — RAW decode, skin sampling, the reference
+profile builder, and the white balance solver. Phases 4–7 (XMP writer,
+Photoshop launch, match-this-shot, batch reporting) are not built yet.
+Nothing is written to disk yet: `correct` reports and stops.
 
 ## Install
 
@@ -36,6 +37,13 @@ vipcolor sample chart.NEF --rect 1200,800,300,300
 # Learn the target from frames you consider correctly graded
 vipcolor build-profile ~/reference-jpegs --face center -o skin-profile.json
 vipcolor show-profile skin-profile.json
+
+# Solve the white balance that puts a RAW's skin on target (writes nothing)
+vipcolor correct shoot/DSC_1234.NEF --profile skin-profile.json
+
+# Check a solve against a grade you already know is right
+vipcolor verify DSC_1234.NEF --profile skin-profile.json --expected-xmp DSC_1234.xmp
+vipcolor verify DSC_1234.NEF --profile skin-profile.json --expected-temp 5400 --expected-tint 8
 
 # Override or blend in a target you judged by eye
 vipcolor build-profile ~/reference-jpegs --target-rgb-range 200,140,112-218,150,122
@@ -163,6 +171,76 @@ person. Five frames shot at different events on different backdrops agreeing on
 hue to two-thirds of a degree is the result that says this approach works —
 and an eyeballed sRGB range supplied by hand landed within 1° of it.
 
+## The solver
+
+`correct` finds the temperature and tint that put a frame's skin on the target,
+and reports them. It writes nothing yet.
+
+**Temperature and tint mean what Camera Raw means by them.** A temperature is a
+point on the Planckian locus and tint is a displacement perpendicular to it in
+the CIE 1960 UCS, which is the model the DNG specification describes. Turning
+that illuminant into camera multipliers uses the camera's own XYZ-to-camera
+matrix. That this is the right matrix is checked rather than assumed: the
+camera's response to D65 through it reproduces LibRaw's own daylight preset to
+1e-6 on a real NEF. The model puts D65 at 6500 K and D50 at 4998 K against
+their true 6504 and 5003, and a blackbody returns its own temperature at tint
+zero. Sign conventions are verified by rendering a synthetic grey card through
+the real pipeline: positive tint renders magenta, higher temperature renders
+warmer, as Camera Raw shows them.
+
+**One render, not dozens.** White balance is applied to camera RGB before the
+camera-to-sRGB matrix, so a render at one white balance reaches any other by a
+single 3x3 similarity transform. That is exact, not an approximation, and it
+turns a search that would take a minute into one that takes about a second and
+a half. Measured against real LibRaw renders of a D500 NEF, the model error is
+**0.001 delta-E**.
+
+That shortcut has one precondition — the matrix rawpy reports must be the one
+LibRaw renders with — and it does not always hold. On DNG input LibRaw adapts
+the matrix during processing and reports the adapted one, where the shortcut
+drifts by **1 to 4 delta-E**. So it is not trusted silently: `--check-model`
+renders once more at the solved setting and reports how far the model is from
+reality, and warns above 0.5 delta-E. Native NEF, which is what this tool is
+for, is unaffected.
+
+**The search follows a valley.** Temperature and tint trade off against each
+other — warm-and-green lands on nearly the same skin colour as cool-and-magenta
+— so the objective has a narrow diagonal valley. Coordinate descent stalls on
+it: an earlier version stopped 814 K short, because from the valley floor
+moving along either axis alone goes uphill. A simplex with a few restarts
+follows the diagonal. Given a white balance to recover, it now returns it to
+within **0.2 K and 0.001 tint** across nine cases from 2800 K to 12000 K.
+
+**Lightness is matched before colour is compared**, and that scale factor is
+reported as the exposure trim. Comparing a Camera Raw–rendered reference
+against a linear RAW render directly would have the solver trying to fix a
+rendering difference by moving the white balance.
+
+Illuminants outside the camera's gamut — the corners of the search box, where
+the sensor's response to the implied light goes negative — are scored as
+infinitely bad, which keeps the search feasible without a separate test.
+Solutions outside 2500–10000 K or a tint of +/-150 are reported and flagged
+rather than clamped into looking reasonable.
+
+### Checking it against your own work
+
+`vipcolor verify` is the accuracy test, and it runs entirely on your machine:
+
+```bash
+vipcolor verify DSC_1234.NEF --profile skin-profile.json --expected-xmp DSC_1234.xmp
+```
+
+Point it at a RAW you have already graded by hand together with the temperature
+and tint you chose, and it reports how close the solver came, in kelvin and in
+mired. Mired is the honest measure — a gap of a few hundred kelvin means
+something quite different at 3000 K than at 9000 K, while about 10 mired is
+roughly where a difference stops being visible on skin.
+
+`vipcolor info` also prints the file's as-shot temperature and tint. Opening the
+same file in Camera Raw with White Balance set to As Shot and comparing those
+two numbers is the quickest check that this tool's idea of temperature agrees
+with Adobe's.
+
 ## A finding that shapes the solver
 
 A reference JPEG has already been through Camera Raw: baseline exposure, tone
@@ -204,7 +282,7 @@ moving the white balance and would land in the wrong place.
 .venv/bin/python -m pytest
 ```
 
-44 tests, no proprietary files needed. `tests/synth.py` writes a valid
+86 tests, no proprietary files needed. `tests/synth.py` writes a valid
 uncompressed DNG from a rendered image, which is how the LibRaw path is tested:
 a frame is synthesised under a known illuminant cast, decoded at the white
 balance that cancels it, and the recovered skin tone is required to land within
@@ -216,6 +294,13 @@ scikit-image's sample data.
 
 ## Known gaps
 
+- The solver has not been checked against a grade a person made. Every
+  accuracy figure above is either internal consistency or a comparison against
+  LibRaw; whether it lands on *your* look is what `vipcolor verify` is for.
+- Camera Raw applies a tone curve that a neutral RAW render does not, which
+  changes saturation but not hue. Solving a rendered-space target against a RAW
+  therefore matches hue soundly and chroma only indicatively; the warning says
+  so, and `--hue-weight` lets hue dominate.
 - Validated on a real Nikon NEF (D500, 5600x3728): camera identity, white
   balance presets, colour matrix, decode, detection and sampling all work,
   in about 7 seconds per file. Not yet validated on the Z8, Z7 or D810, nor

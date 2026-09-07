@@ -125,6 +125,19 @@ def info(path: Path) -> None:
     click.echo(f"colour filter   {details.color_desc}")
     click.echo("as-shot wb      " + "  ".join(f"{m:.4f}" for m in details.camera_wb))
     click.echo("daylight wb     " + "  ".join(f"{m:.4f}" for m in details.daylight_wb))
+
+    from . import whitebalance as wbmod
+
+    as_shot = wbmod.multipliers_to_temp_tint(details.rgb_xyz_matrix, details.camera_wb)
+    daylight = wbmod.multipliers_to_temp_tint(details.rgb_xyz_matrix, details.daylight_wb)
+    click.echo(f"as-shot temp    {as_shot[0]:.0f} K   tint {as_shot[1]:+.0f}")
+    click.echo(f"daylight temp   {daylight[0]:.0f} K   tint {daylight[1]:+.0f}")
+    click.secho(
+        "  ^ open this file in Camera Raw with White Balance: As Shot and compare.\n"
+        "    Those two numbers agreeing is what says this tool's temperature\n"
+        "    means the same thing Adobe's does.",
+        fg="cyan",
+    )
     click.echo("camera -> XYZ matrix (LibRaw, rows RGB):")
     for row in details.rgb_xyz_matrix[:3]:
         click.echo("    " + "  ".join(f"{v: .5f}" for v in row))
@@ -489,3 +502,285 @@ def show_profile_command(path: Path) -> None:
         raise click.ClickException(str(error)) from error
     click.echo("")
     _describe_profile(profile)
+
+
+def _read_xmp_white_balance(path: Path) -> tuple[float | None, float | None]:
+    """Pull crs:Temperature and crs:Tint out of an existing sidecar.
+
+    Deliberately tolerant: sidecars appear both with the values as XML
+    attributes and as child elements, and this only needs to read two of
+    them, not to understand the file.
+    """
+    import re
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    found: dict[str, float] = {}
+    for field in ("Temperature", "Tint"):
+        match = re.search(rf'crs:{field}\s*=\s*"([-+0-9.]+)"', text) or re.search(
+            rf"<crs:{field}>\s*([-+0-9.]+)\s*</crs:{field}>", text
+        )
+        if match:
+            try:
+                found[field] = float(match.group(1))
+            except ValueError:
+                pass
+    return (found.get("Temperature"), found.get("Tint"))
+
+
+def _print_solution(solution, profile) -> None:
+    click.echo(f"  {solution.path.name}")
+    click.echo(f"    camera        {solution.camera}")
+    quality_colour = {"good": "green", "marginal": "yellow", "poor": "red"}[solution.sample.quality]
+    click.secho(f"    sample        {solution.sample.quality}", fg=quality_colour, nl=False)
+    click.echo(
+        f"  ({solution.sample.face_scale:.0f} px between eyes,"
+        f" yaw {solution.sample.pose_yaw:.2f})"
+    )
+    click.echo(
+        f"    as shot       {solution.as_shot[0]:.0f} K   tint {solution.as_shot[1]:+.0f}"
+    )
+    click.secho(
+        f"    solved        {solution.temperature:.0f} K   tint {solution.tint:+.0f}"
+        f"      ({solution.temp_shift:+.0f} K, {solution.tint_shift:+.0f} tint)",
+        fg="cyan",
+    )
+    click.echo(f"    exposure      {solution.exposure_stops:+.2f} stops to reach the target lightness")
+    click.echo(
+        f"    predicted     L* {solution.predicted_lab[0]:6.2f}  a* {solution.predicted_lab[1]:6.2f}"
+        f"  b* {solution.predicted_lab[2]:6.2f}"
+    )
+    click.echo(
+        f"    target        L* {profile.lab[0]:6.2f}  a* {profile.lab[1]:6.2f}"
+        f"  b* {profile.lab[2]:6.2f}"
+    )
+    verdict = "within" if solution.within_tolerance else "OUTSIDE"
+    colour = "green" if solution.within_tolerance else "yellow"
+    click.secho(
+        f"    residual      {solution.delta_e:.2f} dE2000 ({verdict} the {profile.tolerance_de:.2f} "
+        f"tolerance)   hue off by {solution.hue_error_deg:.2f} deg",
+        fg=colour,
+    )
+    click.echo(f"    chroma gap    {solution.chroma_error:+.2f}")
+    import math
+
+    if not math.isnan(solution.model_error):
+        click.echo(
+            f"    model check   {solution.model_error:.3f} dE against a real render"
+        )
+    for warning in solution.warnings:
+        click.secho(f"    warning: {warning}", fg="yellow")
+
+
+def _load_target(profile_path: Path) -> SkinProfile:
+    try:
+        return SkinProfile.load(profile_path)
+    except ProfileError as error:
+        raise click.ClickException(str(error)) from error
+
+
+@main.command()
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "-p",
+    "--profile",
+    "profile_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="The target profile from build-profile.",
+)
+@click.option(
+    "--neutral",
+    type=click.Choice(rawmod.NEUTRAL_SOURCES),
+    default="daylight",
+    show_default=True,
+    help="Which white balance defines the neutral render the solve starts from.",
+)
+@click.option(
+    "--face",
+    default="largest",
+    show_default=True,
+    help="Which face to measure when several are in frame: largest, center, or an index.",
+)
+@click.option(
+    "--hue-weight",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Above 1, hue counts for more than chroma. Useful when the target was "
+    "measured on rendered files and the candidate is a RAW.",
+)
+@click.option("--full-size", is_flag=True, help="Demosaic at full resolution instead of half.")
+@click.option(
+    "--check-model",
+    is_flag=True,
+    help="Render once more at the solved setting to measure how close the fast "
+    "white balance model is to a real render. Roughly doubles the time per file.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def correct(
+    path: Path,
+    profile_path: Path,
+    neutral: str,
+    face: str,
+    hue_weight: float,
+    full_size: bool,
+    check_model: bool,
+    as_json: bool,
+) -> None:
+    """Solve the white balance that puts a RAW file's skin on target.
+
+    Phase 3 reports only; nothing is written. The XMP sidecar comes next.
+    """
+    from .solve import SolveError, solve_file
+
+    profile = _load_target(profile_path)
+    targets = [p for p in iter_images(path, raw_only=True)]
+    if not targets:
+        raise click.ClickException(f"no RAW files found in {path}")
+
+    results = []
+    failures: list[tuple[Path, str]] = []
+    for target in targets:
+        try:
+            solution = solve_file(
+                target,
+                profile,
+                neutral=neutral,
+                select=face,
+                hue_weight=hue_weight,
+                half_size=not full_size,
+                check_model=check_model,
+            )
+        except (SolveError, NoFaceFound, ValueError, OSError) as error:
+            failures.append((target, str(error)))
+            click.secho(f"  {target.name}: {error}", fg="red")
+            continue
+        results.append(solution)
+        if not as_json:
+            _print_solution(solution, profile)
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "target": {"lab": profile.lab, "tolerance_de": profile.tolerance_de},
+                    "solutions": [
+                        {
+                            "file": str(s.path),
+                            "temperature": round(s.temperature, 1),
+                            "tint": round(s.tint, 1),
+                            "as_shot": [round(v, 1) for v in s.as_shot],
+                            "exposure_stops": round(s.exposure_stops, 3),
+                            "predicted_lab": [round(float(v), 3) for v in s.predicted_lab],
+                            "delta_e": round(s.delta_e, 3),
+                            "hue_error_deg": round(s.hue_error_deg, 3),
+                            "chroma_error": round(s.chroma_error, 3),
+                            "within_tolerance": s.within_tolerance,
+                            "model_error": None if s.model_error != s.model_error else round(s.model_error, 4),
+                            "quality": s.sample.quality,
+                            "warnings": s.warnings,
+                        }
+                        for s in results
+                    ],
+                    "failures": [{"file": str(p), "error": e} for p, e in failures],
+                },
+                indent=2,
+            )
+        )
+    elif len(targets) > 1:
+        inside = sum(1 for s in results if s.within_tolerance)
+        click.echo(
+            f"\n  {len(results)} solved ({inside} within tolerance),"
+            f" {len(failures)} failed, of {len(targets)} files"
+        )
+
+    click.secho(
+        "\n  Nothing was written. Set these in Camera Raw by hand to check them,"
+        "\n  or wait for the XMP writer in the next phase.",
+        fg="cyan",
+    )
+
+
+@main.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "-p",
+    "--profile",
+    "profile_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="The target profile to solve against.",
+)
+@click.option("--expected-temp", type=float, default=None, help="The temperature you actually chose.")
+@click.option("--expected-tint", type=float, default=None, help="The tint you actually chose.")
+@click.option(
+    "--expected-xmp",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Read the values you chose from an existing Camera Raw sidecar.",
+)
+@click.option(
+    "--face",
+    default="largest",
+    show_default=True,
+    help="Which face to measure when several are in frame.",
+)
+def verify(
+    path: Path,
+    profile_path: Path,
+    expected_temp: float | None,
+    expected_tint: float | None,
+    expected_xmp: Path | None,
+    face: str,
+) -> None:
+    """Check a solve against a grade you already know is right.
+
+    Point this at a RAW you have already corrected by hand, together with
+    the temperature and tint you chose, and it reports how close the solver
+    came. This is the accuracy check, and it runs entirely on your machine:
+    no file has to go anywhere.
+    """
+    from .solve import SolveError, solve_file
+
+    if expected_xmp is not None:
+        temperature, tint = _read_xmp_white_balance(expected_xmp)
+        if temperature is None:
+            raise click.ClickException(
+                f"{expected_xmp.name} has no crs:Temperature. If Camera Raw wrote it with "
+                "White Balance: As Shot, no temperature is stored -- set it to Custom, or "
+                "pass --expected-temp and --expected-tint from what the panel shows."
+            )
+        expected_temp = temperature
+        expected_tint = tint if tint is not None else 0.0
+
+    if expected_temp is None:
+        raise click.ClickException("give --expected-temp (and --expected-tint), or --expected-xmp")
+    if expected_tint is None:
+        expected_tint = 0.0
+
+    profile = _load_target(profile_path)
+    try:
+        solution = solve_file(path, profile, select=face, check_model=True)
+    except (SolveError, NoFaceFound, ValueError, OSError) as error:
+        raise click.ClickException(str(error)) from error
+
+    from .solve import SkinUnderWhiteBalance  # noqa: F401  (documented in the report below)
+
+    click.echo("")
+    _print_solution(solution, profile)
+    click.echo("")
+    click.secho("  against the grade you chose:", bold=True)
+    click.echo(f"    you chose     {expected_temp:.0f} K   tint {expected_tint:+.0f}")
+    click.echo(f"    solver said   {solution.temperature:.0f} K   tint {solution.tint:+.0f}")
+    temp_gap = solution.temperature - expected_temp
+    tint_gap = solution.tint - expected_tint
+    mired_gap = abs(1e6 / solution.temperature - 1e6 / expected_temp)
+    colour = "green" if mired_gap < 10 and abs(tint_gap) < 10 else "yellow"
+    click.secho(
+        f"    difference    {temp_gap:+.0f} K ({mired_gap:.1f} mired), tint {tint_gap:+.0f}",
+        fg=colour,
+    )
+    click.echo(
+        "\n  A mired gap under about 10 is not visible on skin; a temperature gap of a"
+        "\n  few hundred kelvin at the warm end can be, so mired is the honest measure."
+    )

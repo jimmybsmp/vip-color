@@ -116,6 +116,11 @@ class Patch:
     pixels_total: int
     pixels_used: int
     clipped_fraction: float
+    #: The surviving pixels, linear RGB, kept only when the caller asks.
+    #: The white balance solver re-measures this patch under trial white
+    #: balances, and it must use the same pixels the rejection chose, not a
+    #: fresh rejection pass whose membership would shift as colour moves.
+    pixels: np.ndarray | None = None
 
     @property
     def usable_fraction(self) -> float:
@@ -413,7 +418,13 @@ def _disc_pixels(linear: np.ndarray, center: np.ndarray, radius: float) -> np.nd
     return window[inside].reshape(-1, 3)
 
 
-def _measure(name: str, linear: np.ndarray, center: np.ndarray, radius: float) -> Patch | None:
+def _measure(
+    name: str,
+    linear: np.ndarray,
+    center: np.ndarray,
+    radius: float,
+    keep_pixels: bool = False,
+) -> Patch | None:
     """Robustly reduce one disc of pixels to a single Lab value."""
     pixels = _disc_pixels(linear, center, radius)
     total = len(pixels)
@@ -454,6 +465,7 @@ def _measure(name: str, linear: np.ndarray, center: np.ndarray, radius: float) -
         pixels_total=total,
         pixels_used=int(len(candidate)),
         clipped_fraction=clipped_fraction,
+        pixels=candidate.copy() if keep_pixels else None,
     )
 
 
@@ -464,6 +476,7 @@ def sample_skin(
     min_confidence: float = 0.5,
     landmarks: np.ndarray | None = None,
     select: str = "largest",
+    keep_pixels: bool = False,
 ) -> SkinSample:
     """Detect the face in ``image`` and measure its skin tone in Lab."""
     warnings: list[str] = []
@@ -508,6 +521,7 @@ def sample_skin(
             image.linear,
             _blend(landmarks, _PATCH_LANDMARKS[name]),
             radius * _PATCH_RADIUS_SCALE.get(name, 1.0),
+            keep_pixels=keep_pixels,
         )
         if patch is None:
             warnings.append(f"{name}: too few usable pixels, patch dropped")
@@ -559,6 +573,15 @@ def sample_skin(
         camera=image.camera,
         warnings=warnings,
     )
+
+
+def remeasure(linear: np.ndarray, patch: Patch) -> Patch | None:
+    """Measure the same disc again on a differently rendered image.
+
+    Used to check the solver's fast path against a real render: the patch
+    has to be the same pixels in the same place, not a fresh detection.
+    """
+    return _measure(patch.name, linear, np.array(patch.center), patch.radius)
 
 
 def sample_rect(image: LinearImage, rect: tuple[int, int, int, int], name: str = "manual") -> SkinSample:
