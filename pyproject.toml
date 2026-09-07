@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vipcolor"
+version = "0.1.0"
+description = "Skin-tone driven white balance solving for Nikon RAW files, writing Camera Raw XMP sidecars"
+requires-python = ">=3.11"
+dependencies = [
+    # mediapipe 1.x removed the `mp.solutions` Face Mesh API and moved to the
+    # Tasks API, which fetches its model at runtime.  0.10.x bundles the
+    # .tflite weights in the wheel, which is what keeps this working offline.
+    # It also pins numpy<2, so numpy is pinned to match rather than fighting it.
+    "mediapipe>=0.10.14,<0.11",
+    "numpy>=1.24,<2",
+    # LibRaw 0.21.2 is the first release that decodes the Z8.
+    "rawpy>=0.24",
+    "opencv-python-headless>=4.8",
+    "pillow>=10.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+vipcolor = "vipcolor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

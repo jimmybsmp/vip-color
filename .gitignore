@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Sample and working imagery stays out of the repository: these are photographs
+# of a real person, and RAW files are large.
+samples/
+out/
+*.nef
+*.NEF
+*.xmp
+!tests/fixtures/*
