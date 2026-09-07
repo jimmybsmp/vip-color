@@ -3,9 +3,9 @@
 Consistent skin-tone colour correction for a recurring portrait subject,
 working from Nikon RAW files and writing Adobe Camera Raw XMP sidecars.
 
-**Status: Phase 1 complete** — RAW decode and skin sampling. Phases 2–7
-(profile builder, WB solver, XMP writer, Photoshop launch, match-this-shot,
-batch reporting) are not built yet.
+**Status: Phases 1–2 complete** — RAW decode, skin sampling, and the reference
+profile builder. Phases 3–7 (WB solver, XMP writer, Photoshop launch,
+match-this-shot, batch reporting) are not built yet.
 
 ## Install
 
@@ -32,6 +32,14 @@ vipcolor sample group.jpg --face center --overlay ./check
 
 # No face in frame (a test file, or a grey card)
 vipcolor sample chart.NEF --rect 1200,800,300,300
+
+# Learn the target from frames you consider correctly graded
+vipcolor build-profile ~/reference-jpegs --face center -o skin-profile.json
+vipcolor show-profile skin-profile.json
+
+# Override or blend in a target you judged by eye
+vipcolor build-profile ~/reference-jpegs --target-rgb-range 200,140,112-218,150,122
+vipcolor build-profile ~/reference-jpegs --target-lab 66,23,27 --target-mode override
 ```
 
 `--overlay DIR` writes an annotated PNG per file showing exactly which pixels
@@ -103,6 +111,57 @@ profile.
 
 **No face means no answer.** Frames where no face is detected are reported as
 failures, never guessed at.
+
+## The reference profile
+
+`build-profile` measures a folder of frames whose colour you already consider
+right, and writes the target to JSON. Rebuild it whenever you add references —
+it is a plain re-run of the same command.
+
+- **Bad frames are excluded, not averaged in.** Every sample carries the
+  quality verdict described above, and anything below `--min-quality`
+  (default `marginal`) is recorded in the file but contributes nothing. On a
+  real six-frame set this excluded a three-quarter-profile shot sitting 15
+  delta-E from the rest.
+- **Marginal frames count less than good ones**, at 0.4 weight, rather than
+  being all-or-nothing.
+- **The tolerance is derived from the evidence** — mean plus two standard
+  deviations of the references' own scatter, floored at 2 delta-E, which is
+  roughly where a difference on skin stops being visible. `--tolerance` fixes
+  it by hand.
+- **Hue spread is computed as a circular statistic.** Skin never sits near the
+  0/360 wrap, but a mean that is only right for convenient inputs is a trap for
+  whoever reuses it.
+- **The centre is the mean Lab**, with hue and chroma read off it, so
+  `hue_of(profile.lab) == profile.hue`. The circular statistics set the
+  *spread*, which is what drives the tolerance.
+- **A profile records its rendering space, and mixing is refused.** Building
+  one profile from both JPEGs and RAWs raises an error rather than averaging
+  two things that differ by two stops — see the finding below.
+
+You can also supply the target by hand, which is the "I know the face runs
+about here" case: `--target-lab`, `--target-rgb`, or `--target-rgb-range`. A
+range becomes a real bound — its midpoint is the target and half its diagonal
+becomes the tolerance — instead of being silently treated as an exact value.
+`--target-mode merge|override` and `--merge-weight` decide whether it blends
+with the measured profile or replaces it. Merging blends lightness, chroma and
+hue in their own terms rather than averaging a* and b*, so a disagreement
+between the two does not drag the result towards grey.
+
+### What it produced on a real set
+
+Six frames of one subject across four events and four different backdrops:
+
+| | default `--face largest` | `--face center` |
+| --- | --- | --- |
+| hue spread | ±2.13° | **±0.63°** |
+| tolerance | 3.88 delta-E | **3.02 delta-E** |
+| worst frame | 3.61 delta-E | 2.53 delta-E |
+
+The difference is entirely the group shot, where `largest` measured the wrong
+person. Five frames shot at different events on different backdrops agreeing on
+hue to two-thirds of a degree is the result that says this approach works —
+and an eyeballed sRGB range supplied by hand landed within 1° of it.
 
 ## A finding that shapes the solver
 

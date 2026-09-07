@@ -12,6 +12,14 @@ from . import raw as rawmod
 from .color import delta_e_2000
 from .faces import DEFAULT_PATCHES, NoFaceFound, SkinSample, sample_rect, sample_skin
 from .images import iter_images, load_linear
+from .profile import (
+    QUALITY_ORDER,
+    ProfileError,
+    SkinProfile,
+    build_profile,
+    manual_profile,
+    merge_profiles,
+)
 
 PATCH_CHOICES = ("forehead", "cheek_left", "cheek_right", "chin")
 
@@ -249,3 +257,235 @@ def sample(
 
     if failures and not results:
         sys.exit(1)
+
+
+def _parse_triple(value: str, what: str) -> tuple[float, float, float]:
+    parts = value.replace(" ", "").split(",")
+    if len(parts) != 3:
+        raise click.BadParameter(f"expected three comma-separated numbers for {what}")
+    try:
+        return tuple(float(p) for p in parts)  # type: ignore[return-value]
+    except ValueError as error:
+        raise click.BadParameter(f"not a number in {what}: {error}") from error
+
+
+def _parse_rgb_range(value: str) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Parse 'R,G,B-R,G,B': the low and high corners of an sRGB box."""
+    if "-" not in value:
+        raise click.BadParameter("expected two sRGB triples separated by '-', e.g. 200,140,115-215,155,130")
+    low_text, high_text = value.split("-", 1)
+    low = _parse_triple(low_text, "the lower sRGB bound")
+    high = _parse_triple(high_text, "the upper sRGB bound")
+    return (
+        tuple(int(round(v)) for v in low),  # type: ignore[return-value]
+        tuple(int(round(v)) for v in high),  # type: ignore[return-value]
+    )
+
+
+def _describe_profile(profile: SkinProfile) -> None:
+    click.echo(f"  origin        {profile.origin}  ({profile.render_space} space)")
+    if profile.note:
+        click.echo(f"  note          {profile.note}")
+    click.echo(
+        f"  target Lab    L* {profile.lab[0]:6.2f}   a* {profile.lab[1]:6.2f}   "
+        f"b* {profile.lab[2]:6.2f}      (sRGB {profile.srgb8[0]},{profile.srgb8[1]},"
+        f"{profile.srgb8[2]})"
+    )
+    if profile.samples_used:
+        click.echo(
+            f"  spread        L* +/-{profile.lab_std[0]:.2f}  "
+            f"a* +/-{profile.lab_std[1]:.2f}  b* +/-{profile.lab_std[2]:.2f}"
+        )
+    click.echo(
+        f"  hue           {profile.hue:.2f} deg +/-{profile.hue_std:.2f}"
+        f"   (tolerance {profile.hue_tolerance_deg:.2f} deg)"
+    )
+    click.echo(f"  chroma        {profile.chroma:.2f} +/-{profile.chroma_std:.2f}")
+    click.echo(f"  lightness     L* {profile.lightness:.2f} +/-{profile.lightness_std:.2f}")
+    click.echo(f"  tolerance     {profile.tolerance_de:.2f} dE2000")
+    if profile.samples_seen:
+        click.echo(f"  built from    {profile.samples_used} of {profile.samples_seen} frames")
+
+
+@main.command("build-profile")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=Path("skin-profile.json"),
+    show_default=True,
+    help="Where to write the profile.",
+)
+@click.option(
+    "--min-quality",
+    type=click.Choice(QUALITY_ORDER),
+    default="marginal",
+    show_default=True,
+    help="Lowest sample quality allowed to contribute to the target.",
+)
+@click.option(
+    "--tolerance",
+    type=float,
+    default=None,
+    help="Fix the target tolerance in dE2000 instead of deriving it from the spread.",
+)
+@click.option(
+    "--face",
+    default="largest",
+    show_default=True,
+    help="Which face to measure when several are in frame: largest, center, or an index.",
+)
+@click.option(
+    "--overlay",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Write an annotated PNG per reference frame, to check what was measured.",
+)
+@click.option("--target-lab", default=None, help="Hand-supplied Lab target, 'L,a,b'.")
+@click.option("--target-rgb", default=None, help="Hand-supplied sRGB target, 'R,G,B'.")
+@click.option(
+    "--target-rgb-range",
+    default=None,
+    help="Hand-supplied sRGB range, 'R,G,B-R,G,B'. Its midpoint is the target and "
+    "half its width becomes the tolerance.",
+)
+@click.option(
+    "--target-mode",
+    type=click.Choice(["merge", "override"]),
+    default="merge",
+    show_default=True,
+    help="Whether a hand-supplied target blends with the measured one or replaces it.",
+)
+@click.option(
+    "--merge-weight",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="How much the hand-supplied target counts when merging, 0 to 1.",
+)
+@click.option("--dry-run", is_flag=True, help="Report the profile without writing it.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the profile as JSON on stdout.")
+def build_profile_command(
+    path: Path,
+    output: Path,
+    min_quality: str,
+    tolerance: float | None,
+    face: str,
+    overlay: Path | None,
+    target_lab: str | None,
+    target_rgb: str | None,
+    target_rgb_range: str | None,
+    target_mode: str,
+    merge_weight: float,
+    dry_run: bool,
+    as_json: bool,
+) -> None:
+    """Learn the target skin tone from a folder of correctly graded frames."""
+    from . import faces as facesmod
+    from .debug import write_overlay
+
+    hand_supplied = [target_lab, target_rgb, target_rgb_range]
+    if sum(value is not None for value in hand_supplied) > 1:
+        raise click.BadParameter("give at most one of --target-lab, --target-rgb, --target-rgb-range")
+
+    targets = iter_images(path)
+    if not targets:
+        raise click.ClickException(f"no supported images found in {path}")
+
+    samples: list[SkinSample] = []
+    failures: list[tuple[Path, str]] = []
+    for target in targets:
+        try:
+            image = load_linear(target)
+            found = facesmod.detect_faces(image)
+            picked, _how = facesmod.select_face(found, image, select=face)
+            measured = sample_skin(image, landmarks=picked.landmarks, select=face)
+            measured.faces_found = len(found)
+            measured.detector_score = picked.score
+        except (NoFaceFound, ValueError, OSError) as error:
+            failures.append((target, str(error)))
+            click.secho(f"  skipped {target.name}: {error}", fg="red")
+            continue
+        if overlay is not None:
+            write_overlay(image, measured, overlay / f"{target.stem}_patches.png")
+        samples.append(measured)
+
+    if not samples:
+        raise click.ClickException("no reference frame could be measured")
+
+    try:
+        measured_profile = build_profile(
+            samples, min_quality=min_quality, tolerance=tolerance
+        )
+    except ProfileError as error:
+        raise click.ClickException(str(error)) from error
+
+    profile = measured_profile
+    if any(value is not None for value in hand_supplied):
+        try:
+            hand = manual_profile(
+                lab=_parse_triple(target_lab, "--target-lab") if target_lab else None,
+                rgb=(
+                    tuple(int(round(v)) for v in _parse_triple(target_rgb, "--target-rgb"))
+                    if target_rgb
+                    else None
+                ),
+                rgb_range=_parse_rgb_range(target_rgb_range) if target_rgb_range else None,
+                tolerance=tolerance,
+                render_space=measured_profile.render_space,
+            )
+            profile = (
+                hand
+                if target_mode == "override"
+                else merge_profiles(measured_profile, hand, weight=merge_weight)
+            )
+        except ProfileError as error:
+            raise click.ClickException(str(error)) from error
+
+    if as_json:
+        import dataclasses
+
+        click.echo(json.dumps(dataclasses.asdict(profile), indent=2))
+    else:
+        click.echo("")
+        _describe_profile(profile)
+        excluded = [source for source in profile.sources if not source.used]
+        if excluded:
+            click.echo("")
+            click.secho(f"  {len(excluded)} frame(s) excluded from the target:", fg="yellow")
+            for source in excluded:
+                click.echo(
+                    f"    {Path(source.file).name}  quality={source.quality}"
+                    f"  yaw={source.pose_yaw:.2f}  eye={source.face_scale:.0f}px"
+                )
+        for source in profile.sources:
+            if source.used:
+                distance = profile.distance(source.lab)
+                marker = " " if distance <= profile.tolerance_de else "!"
+                click.echo(
+                    f"   {marker} {Path(source.file).name[:44]:<46}"
+                    f" dE {distance:5.2f}   hue {source.hue:6.2f}"
+                )
+        if failures:
+            click.echo(f"\n  {len(failures)} file(s) could not be measured")
+
+    if dry_run:
+        click.echo("\n  --dry-run: nothing written")
+        return
+
+    profile.save(output)
+    if not as_json:
+        click.echo(f"\n  written to {output}")
+
+
+@main.command("show-profile")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def show_profile_command(path: Path) -> None:
+    """Print a saved profile."""
+    try:
+        profile = SkinProfile.load(path)
+    except ProfileError as error:
+        raise click.ClickException(str(error)) from error
+    click.echo("")
+    _describe_profile(profile)
