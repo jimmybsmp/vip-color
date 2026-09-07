@@ -104,6 +104,30 @@ profile.
 **No face means no answer.** Frames where no face is detected are reported as
 failures, never guessed at.
 
+## A finding that shapes the solver
+
+A reference JPEG has already been through Camera Raw: baseline exposure, tone
+curve, the photographer's own grade. The neutral RAW render here deliberately
+has none of that. On real files the gap is about two stops — reference JPEGs of
+the subject sample at L* 64, while a linear NEF render of a comparable face
+samples at L* 32.
+
+So **absolute Lab cannot be compared between a rendered reference and a linear
+RAW render.** Measured on a real NEF across four stops of exposure:
+
+| quantity | change across ±2 stops |
+| --- | --- |
+| hue angle | **0.29 degrees** |
+| chroma / L* | 52% |
+| absolute Lab (delta-E 2000) | 40.5 |
+
+Hue angle is the exposure-invariant quantity, and hue is also most of what
+white balance actually controls. The consequence for Phase 3 is that the solve
+should target **hue angle, and chroma only after lightness has been matched**,
+with exposure handled as its own trim — not a single delta-E against an
+absolute Lab target, which would try to correct a rendering difference by
+moving the white balance and would land in the wrong place.
+
 ## Deviations from the original spec
 
 - **`colour-science` is not used.** The Lab and CIEDE2000 code is hand-rolled
@@ -133,8 +157,10 @@ scikit-image's sample data.
 
 ## Known gaps
 
-- Not yet validated against a real NEF, or against files with a known-correct
-  hand grade. Everything RAW-side is proven against synthetic DNGs only.
+- Validated on a real Nikon NEF (D500, 5600x3728): camera identity, white
+  balance presets, colour matrix, decode, detection and sampling all work,
+  in about 7 seconds per file. Not yet validated on the Z8, Z7 or D810, nor
+  against any file with a known-correct hand grade.
 - The `--face largest` default is a guess about which person is the subject,
   and on a real five-person group frame it picked the wrong man. Check the
   overlay on any group shot, or prefer `--face center`. Better still, build
