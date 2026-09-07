@@ -63,12 +63,36 @@ _FLOOR = 0.004                # below this, read noise dominates
 _SPECULAR_PERCENTILE = 85.0   # drop the brightest tail: sheen, sweat, glare
 _SHADOW_PERCENTILE = 10.0     # drop the darkest tail: pores, stubble, creases
 _CHROMA_REJECT_DE = 12.0      # drop pixels this far from the patch's own colour
-_MIN_USABLE_PIXELS = 40       # below this a patch is not worth trusting
+_MIN_USABLE_PIXELS = 12       # below this a patch is not worth trusting
+_LOW_PIXEL_WARN = 60          # above this, the patch median is comfortably stable
+
+#: Eye-corner separation below which a face is small enough that JPEG chroma
+#: subsampling starts to matter -- the colour resolution is half the luma
+#: resolution, so a small face's skin tone is measured from very few real
+#: chroma samples.
+_SMALL_FACE_EYE_PX = 45.0
 
 #: How many faces to look for.  Group shots are the reason this is not 1:
 #: silently measuring whichever face the detector happened to return first
 #: would build a profile from the wrong person.
 MAX_FACES = 8
+
+#: How far past the detector's box to crop before landmarking, and the size
+#: band the crop is scaled into.  Face Mesh needs context and enough pixels.
+_CROP_EXPANSION = 2.0
+_CROP_MIN_EDGE = 256
+_CROP_MAX_EDGE = 512
+
+#: Head turn, as the nose tip's offset along the eye-corner axis: 0 is
+#: square to camera, 1 is full profile.  A turned head puts one cheek in
+#: different light from the other, which is measurable long before it is
+#: obvious, so it is scored rather than eyeballed.
+POSE_WARN_YAW = 0.25
+POSE_REJECT_YAW = 0.60
+
+#: Eye separation below which landmark placement error is a large fraction
+#: of a patch radius.
+MIN_RELIABLE_EYE_PX = 20.0
 
 #: Patches whose *chroma* disagrees by more than this are the ones that
 #: threaten a white balance solve.  Luminance disagreement between forehead
@@ -112,6 +136,27 @@ class SkinSample:
     spread: float
     chroma_spread: float
     faces_found: int
+    detector_score: float
+    pose_yaw: float
+    face_scale: float
+
+    @property
+    def quality(self) -> str:
+        """A one-word verdict, for filtering reference images and batch runs."""
+        if (
+            self.pose_yaw > POSE_REJECT_YAW
+            or self.chroma_spread > 2 * CHROMA_SPREAD_WARN_DE
+            or self.face_scale < MIN_RELIABLE_EYE_PX
+        ):
+            return "poor"
+        if (
+            self.pose_yaw > POSE_WARN_YAW
+            or self.chroma_spread > CHROMA_SPREAD_WARN_DE
+            or self.face_scale < _SMALL_FACE_EYE_PX
+            or min((p.pixels_used for p in self.patches), default=0) < _LOW_PIXEL_WARN
+        ):
+            return "marginal"
+        return "good"
     luminance_range: float
     colour_note: str
     camera: str | None = None
@@ -142,56 +187,164 @@ def _quiet():
             os.environ["GLOG_minloglevel"] = previous
 
 
+@dataclass(frozen=True)
+class DetectedFace:
+    """One face located in the frame, with landmarks in full-image pixels."""
+
+    landmarks: np.ndarray
+    score: float
+    box: tuple[int, int, int, int]
+
+    @property
+    def size(self) -> float:
+        """Bounding-box diagonal: how much of the frame this face fills."""
+        extent = self.landmarks.max(axis=0) - self.landmarks.min(axis=0)
+        return float(np.hypot(*extent))
+
+
+def _detection_boxes(
+    detector_input: np.ndarray, min_confidence: float, max_faces: int
+) -> list[tuple[tuple[float, float, float, float], float]]:
+    """Locate faces with the full-range detector, largest first.
+
+    Face Mesh's own detector is BlazeFace *short range*, which assumes the
+    face fills much of the frame.  Event photography does the opposite: a
+    head a couple of hundred pixels wide in a 3000 px frame, which that
+    model simply does not see.  So detection is done separately with the
+    full-range model and Face Mesh is handed a crop.
+    """
+    import mediapipe as mp
+
+    with mp.solutions.face_detection.FaceDetection(
+        model_selection=1, min_detection_confidence=min_confidence
+    ) as detector:
+        result = detector.process(detector_input)
+
+    if not result.detections:
+        return []
+
+    height, width = detector_input.shape[:2]
+    boxes = []
+    for detection in result.detections:
+        relative = detection.location_data.relative_bounding_box
+        box = (
+            relative.xmin * width,
+            relative.ymin * height,
+            relative.width * width,
+            relative.height * height,
+        )
+        if box[2] <= 0 or box[3] <= 0:
+            continue
+        score = float(detection.score[0]) if detection.score else 0.0
+        boxes.append((box, score))
+
+    boxes.sort(key=lambda item: item[0][2] * item[0][3], reverse=True)
+    return boxes[:max_faces]
+
+
+def _crop_around(
+    encoded: np.ndarray, box: tuple[float, float, float, float], scale: float
+) -> tuple[np.ndarray, int, int]:
+    """Cut a padded region around a detection, in full-resolution pixels."""
+    x, y, width, height = (value / scale for value in box)
+    centre_x, centre_y = x + width / 2.0, y + height / 2.0
+    # Face Mesh wants context around the face, not a tight crop.
+    half = max(width, height) * _CROP_EXPANSION / 2.0
+
+    image_height, image_width = encoded.shape[:2]
+    x0 = max(0, int(centre_x - half))
+    y0 = max(0, int(centre_y - half))
+    x1 = min(image_width, int(centre_x + half))
+    y1 = min(image_height, int(centre_y + half))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return np.empty((0, 0, 3), dtype=np.uint8), 0, 0
+    return encoded[y0:y1, x0:x1], x0, y0
+
+
 def detect_faces(
     image: LinearImage,
     *,
     min_confidence: float = 0.5,
     max_faces: int = MAX_FACES,
-) -> list[np.ndarray]:
-    """Every face in the frame, as (N, 2) pixel-coordinate landmark arrays.
+) -> list[DetectedFace]:
+    """Every face in the frame, largest first, landmarked in image pixels.
 
-    Detection runs on an sRGB-encoded, downscaled copy because that is what
-    the model was trained on; the returned coordinates are scaled back to
-    the full-resolution linear image, which is where sampling happens.
-    Faces come back largest first.
+    Two stages: the full-range detector finds faces anywhere in the frame,
+    then Face Mesh landmarks each one from a crop.  Landmark coordinates are
+    mapped back to the full-resolution image, which is where skin is
+    measured -- the crop is only ever an input to the landmarker.
     """
+    import cv2
+
     with _quiet():
         import mediapipe as mp
 
-        detector_input, _scale = image.detector_image()
+        detector_input, scale = image.detector_image()
+        boxes = _detection_boxes(detector_input, min_confidence, max_faces)
+        if not boxes:
+            raise NoFaceFound(f"no face detected in {image.path.name}")
+
+        encoded = image.encoded8()
+        found: list[DetectedFace] = []
         with mp.solutions.face_mesh.FaceMesh(
             static_image_mode=True,
-            max_num_faces=max_faces,
+            max_num_faces=1,
             refine_landmarks=True,
             min_detection_confidence=min_confidence,
         ) as mesh:
-            result = mesh.process(detector_input)
+            for box, score in boxes:
+                crop, x0, y0 = _crop_around(encoded, box, scale)
+                if crop.size == 0:
+                    continue
 
-    if not result.multi_face_landmarks:
-        raise NoFaceFound(f"no face detected in {image.path.name}")
+                # Upscale a small crop so the landmarker sees enough detail;
+                # keep the aspect ratio so landmarks are not skewed.
+                crop_height, crop_width = crop.shape[:2]
+                longest = max(crop_height, crop_width)
+                resized, factor = crop, 1.0
+                if longest < _CROP_MIN_EDGE:
+                    factor = _CROP_MIN_EDGE / longest
+                elif longest > _CROP_MAX_EDGE:
+                    factor = _CROP_MAX_EDGE / longest
+                if factor != 1.0:
+                    resized = cv2.resize(
+                        crop,
+                        (max(2, round(crop_width * factor)), max(2, round(crop_height * factor))),
+                        interpolation=cv2.INTER_AREA if factor < 1 else cv2.INTER_CUBIC,
+                    )
 
-    height, width = image.linear.shape[:2]
-    # Landmarks are normalised to the detector input, so they map onto the
-    # full-resolution image by scaling alone.
-    faces = [
-        np.array([[lm.x * width, lm.y * height] for lm in face.landmark], dtype=np.float64)
-        for face in result.multi_face_landmarks
-    ]
-    return sorted(faces, key=_face_size, reverse=True)
+                result = mesh.process(np.ascontiguousarray(resized))
+                if not result.multi_face_landmarks:
+                    continue
 
+                landmarks = np.array(
+                    [
+                        [x0 + lm.x * crop_width, y0 + lm.y * crop_height]
+                        for lm in result.multi_face_landmarks[0].landmark
+                    ],
+                    dtype=np.float64,
+                )
+                found.append(
+                    DetectedFace(
+                        landmarks=landmarks,
+                        score=score,
+                        box=(x0, y0, crop_width, crop_height),
+                    )
+                )
 
-def _face_size(landmarks: np.ndarray) -> float:
-    """Bounding-box diagonal, used to rank faces by how much frame they fill."""
-    extent = landmarks.max(axis=0) - landmarks.min(axis=0)
-    return float(np.hypot(*extent))
+    if not found:
+        raise NoFaceFound(
+            f"{len(boxes)} face(s) detected in {image.path.name} but none could be landmarked"
+        )
+    return sorted(found, key=lambda f: f.size, reverse=True)
 
 
 def select_face(
-    faces: list[np.ndarray],
+    faces: list[DetectedFace],
     image: LinearImage,
     *,
     select: str = "largest",
-) -> tuple[np.ndarray, str]:
+) -> tuple[DetectedFace, str]:
     """Choose which detected face to measure, and say how it was chosen."""
     if not faces:
         raise NoFaceFound("no faces to select from")
@@ -200,8 +353,10 @@ def select_face(
     if select == "center":
         height, width = image.linear.shape[:2]
         middle = np.array([width / 2.0, height / 2.0])
-        ranked = min(faces, key=lambda f: float(np.linalg.norm(f.mean(axis=0) - middle)))
-        return ranked, "most central face"
+        chosen = min(
+            faces, key=lambda f: float(np.linalg.norm(f.landmarks.mean(axis=0) - middle))
+        )
+        return chosen, "most central face"
     if select.isdigit():
         index = int(select)
         if index >= len(faces):
@@ -217,9 +372,24 @@ def detect_landmarks(
     select: str = "largest",
 ) -> np.ndarray:
     """The landmarks of the one face this image should be measured on."""
-    faces = detect_faces(image, min_confidence=min_confidence)
-    chosen, _how = select_face(faces, image, select=select)
-    return chosen
+    chosen, _how = select_face(detect_faces(image, min_confidence=min_confidence), image, select=select)
+    return chosen.landmarks
+
+
+def head_yaw(landmarks: np.ndarray) -> float:
+    """How far the head is turned, from 0 (square on) to 1 (full profile).
+
+    Measured as where the nose tip falls along the line joining the outer
+    eye corners.  It needs no camera model and no 3-D fit, and it degrades
+    gracefully: a slightly turned head scores slightly above zero.
+    """
+    left, right, nose = landmarks[_EYE_OUTER_LEFT], landmarks[_EYE_OUTER_RIGHT], landmarks[1]
+    axis = right - left
+    denominator = float(axis @ axis)
+    if denominator <= 0:
+        return 1.0
+    position = float((nose - left) @ axis) / denominator
+    return float(min(1.0, abs(position - 0.5) * 2.0))
 
 
 def _blend(landmarks: np.ndarray, weighted: tuple) -> np.ndarray:
@@ -298,10 +468,13 @@ def sample_skin(
     """Detect the face in ``image`` and measure its skin tone in Lab."""
     warnings: list[str] = []
     faces_found = 1
+    score = float("nan")
     if landmarks is None:
         detected = detect_faces(image, min_confidence=min_confidence)
         faces_found = len(detected)
-        landmarks, how = select_face(detected, image, select=select)
+        chosen, how = select_face(detected, image, select=select)
+        landmarks = chosen.landmarks
+        score = chosen.score
         if faces_found > 1:
             warnings.append(
                 f"{faces_found} faces detected; measured the {how}. "
@@ -312,6 +485,19 @@ def sample_skin(
     if not np.isfinite(scale) or scale <= 0:
         raise NoFaceFound(f"degenerate face geometry in {image.path.name}")
     radius = scale * _PATCH_RADIUS_FRACTION
+    yaw = head_yaw(landmarks)
+    if yaw > POSE_REJECT_YAW:
+        warnings.append(
+            f"head is turned well off camera (yaw {yaw:.2f}); the cheeks are in different "
+            "light and this sample should not be trusted"
+        )
+    elif yaw > POSE_WARN_YAW:
+        warnings.append(f"head is turned (yaw {yaw:.2f}); cheek patches may disagree")
+    if scale < _SMALL_FACE_EYE_PX:
+        warnings.append(
+            f"small face: {scale:.0f} px between eye corners. On a JPEG the chroma is "
+            "subsampled, so this measurement rests on few colour samples"
+        )
 
     measured: list[Patch] = []
     for name in patches:
@@ -326,6 +512,8 @@ def sample_skin(
         if patch is None:
             warnings.append(f"{name}: too few usable pixels, patch dropped")
             continue
+        if patch.pixels_used < _LOW_PIXEL_WARN:
+            warnings.append(f"{name}: only {patch.pixels_used} usable pixels")
         if patch.clipped_fraction > 0.25:
             warnings.append(f"{name}: {patch.clipped_fraction:.0%} of pixels clipped")
         measured.append(patch)
@@ -363,6 +551,9 @@ def sample_skin(
         spread=spread,
         chroma_spread=chroma_spread,
         faces_found=faces_found,
+        detector_score=score,
+        pose_yaw=yaw,
+        face_scale=scale,
         luminance_range=luminance_range,
         colour_note=image.colour_note,
         camera=image.camera,
@@ -389,6 +580,9 @@ def sample_rect(image: LinearImage, rect: tuple[int, int, int, int], name: str =
         spread=0.0,
         chroma_spread=0.0,
         faces_found=0,
+        detector_score=float("nan"),
+        pose_yaw=float("nan"),
+        face_scale=float("nan"),
         luminance_range=0.0,
         colour_note=image.colour_note,
         camera=image.camera,

@@ -66,6 +66,15 @@ littleCMS; untagged files are assumed sRGB and the output says so. Reading an
 Adobe RGB export as sRGB would bake several delta-E of error into the target
 profile, silently.
 
+**Detection is two-stage.** Face Mesh's built-in detector is BlazeFace
+*short range*, which assumes the face fills much of the frame. Event
+photography does the opposite -- a head a couple of hundred pixels wide in a
+3000 px frame -- and that model simply does not see it. So faces are located
+with the **full-range** detector, and Face Mesh is handed a padded crop of each
+one. Landmarks are mapped back to the full-resolution image, which is where
+skin is actually measured. On a set of real event frames this was the
+difference between zero faces found and all of them.
+
 **Sampling.** Three patches by default — forehead, both cheeks below the eyes —
 placed from blends of several MediaPipe landmarks so a small landmark wobble
 moves a patch by much less than its own radius. Inside each patch, pixels are
@@ -81,6 +90,16 @@ brightness difference. Splitting them matters because a forehead brighter than
 a cheek is ordinary directional light, while patches that disagree in *colour*
 mean mixed light sources or a patch that is not on skin — only the second
 threatens a white-balance solve.
+
+**Every sample carries a verdict.** `good`, `marginal` or `poor`, from head
+pose, face size, patch agreement and pixel counts. Head turn is scored as
+`yaw`: where the nose tip falls along the line between the outer eye corners,
+0 square-on to 1 in profile. It matters because a turned head puts one cheek in
+different light from the other -- on a real reference set, frontal frames
+scored 0.02 to 0.10 while a three-quarter profile scored 0.88 and its patches
+disagreed by 30 delta-E. That frame's skin measurement sat 15 delta-E from the
+rest of the set; without a pose score it would have quietly poisoned the
+profile.
 
 **No face means no answer.** Frames where no face is detected are reported as
 failures, never guessed at.
@@ -102,7 +121,7 @@ failures, never guessed at.
 .venv/bin/python -m pytest
 ```
 
-40 tests, no proprietary files needed. `tests/synth.py` writes a valid
+44 tests, no proprietary files needed. `tests/synth.py` writes a valid
 uncompressed DNG from a rendered image, which is how the LibRaw path is tested:
 a frame is synthesised under a known illuminant cast, decoded at the white
 balance that cancels it, and the recovered skin tone is required to land within
@@ -116,8 +135,16 @@ scikit-image's sample data.
 
 - Not yet validated against a real NEF, or against files with a known-correct
   hand grade. Everything RAW-side is proven against synthetic DNGs only.
-- The `--face largest` default is a guess about which person is the subject.
-  For group shots, check the overlay.
+- The `--face largest` default is a guess about which person is the subject,
+  and on a real five-person group frame it picked the wrong man. Check the
+  overlay on any group shot, or prefer `--face center`. Better still, build
+  profiles from solo frames only.
+- Detection can still fail on a very wide frame containing a very small face:
+  MediaPipe resizes its detector input to a square without letterboxing, so a
+  2.5:1 frame horizontally squashes every face in it. Letterboxing was tried
+  and made real-world results slightly worse, so it was not adopted. Tiled
+  detection would be the fix if this shows up in practice; `--rect` is the
+  escape hatch meanwhile.
 - Camera differences between the Z8, Z7 and D810 are handled by LibRaw's
   per-body colour matrices and daylight presets, but this has not been
   confirmed on real files from all three bodies.

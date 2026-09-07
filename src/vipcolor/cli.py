@@ -39,6 +39,10 @@ def _sample_to_dict(sample: SkinSample) -> dict:
         "lab": [round(float(v), 3) for v in sample.lab],
         "srgb8": list(sample.srgb8),
         "faces_found": sample.faces_found,
+        "detector_score": round(sample.detector_score, 4),
+        "pose_yaw": round(sample.pose_yaw, 4),
+        "face_scale_px": round(sample.face_scale, 1),
+        "quality": sample.quality,
         "spread_de2000": round(sample.spread, 3),
         "chroma_spread_de2000": round(sample.chroma_spread, 3),
         "luminance_range": round(sample.luminance_range, 3),
@@ -65,8 +69,14 @@ def _print_sample(sample: SkinSample) -> None:
     if sample.camera:
         click.echo(f"    camera        {sample.camera}")
     click.echo(f"    render        {sample.colour_note}")
-    if sample.faces_found > 1:
-        click.echo(f"    faces found   {sample.faces_found}")
+    if sample.faces_found:
+        click.echo(
+            f"    detection     {sample.faces_found} face(s),"
+            f" confidence {sample.detector_score:.2f},"
+            f" {sample.face_scale:.0f} px between eyes, yaw {sample.pose_yaw:.2f}"
+        )
+        colour = {"good": "green", "marginal": "yellow", "poor": "red"}[sample.quality]
+        click.secho(f"    quality       {sample.quality}", fg=colour)
     click.echo(
         f"    skin Lab      L* {lab[0]:6.2f}   a* {lab[1]:6.2f}   b* {lab[2]:6.2f}"
         f"      (sRGB {sample.srgb8[0]},{sample.srgb8[1]},{sample.srgb8[2]})"
@@ -182,11 +192,13 @@ def sample(
                 measured = sample_rect(image, rectangle)
             else:
                 found = facesmod.detect_faces(image)
-                detected, _how = facesmod.select_face(found, image, select=face)
+                picked, _how = facesmod.select_face(found, image, select=face)
+                detected = picked.landmarks
                 measured = sample_skin(
                     image, patches=chosen, landmarks=detected, select=face
                 )
                 measured.faces_found = len(found)
+                measured.detector_score = picked.score
                 if len(found) > 1:
                     note = (
                         f"{len(found)} faces detected; measured the "

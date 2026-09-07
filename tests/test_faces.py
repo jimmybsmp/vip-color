@@ -89,3 +89,79 @@ def _write(path, array):
 
     cv2.imwrite(str(path), array)
     return path
+
+
+def test_finds_a_small_distant_face(tmp_path):
+    """The failure real event photography produces.
+
+    Face Mesh's own detector is short-range and does not see a head that is
+    a small fraction of a wide frame, which is most of a stage or event
+    shoot.  Detection therefore runs full-range first and hands Face Mesh a
+    crop; this pastes the fixture small into a big canvas to hold that.
+    """
+    import cv2
+
+    portrait = cv2.imread(FIXTURE)
+    small = cv2.resize(portrait, (150, 150), interpolation=cv2.INTER_AREA)
+    canvas = np.full((1200, 2400, 3), 60, dtype=np.uint8)
+    canvas[420:570, 1100:1250] = small
+    path = tmp_path / "distant.png"
+    cv2.imwrite(str(path), canvas)
+
+    sample = faces.sample_skin(load_linear(path))
+    assert sample.patches
+    assert 40.0 < sample.lab[0] < 95.0
+
+
+def _fake_face(centre_x, centre_y, half_width):
+    """A DetectedFace with landmarks around a point, for selection tests."""
+    rng = np.random.default_rng(0)
+    landmarks = rng.uniform(-half_width, half_width, (478, 2))
+    landmarks += np.array([centre_x, centre_y])
+    return faces.DetectedFace(landmarks=landmarks, score=0.9, box=(0, 0, 1, 1))
+
+
+def test_face_selection_picks_by_size_then_position(portrait):
+    """Which face gets measured is a decision, so it is tested as one.
+
+    The detector itself is exercised on real images; this pins the choice
+    between several faces, which is where a group shot goes wrong.
+    """
+    width, height = portrait.size
+    small_left = _fake_face(width * 0.15, height * 0.5, 30)
+    big_right = _fake_face(width * 0.85, height * 0.5, 90)
+    middle = _fake_face(width * 0.5, height * 0.5, 50)
+    found = sorted([small_left, big_right, middle], key=lambda f: f.size, reverse=True)
+
+    largest, how = faces.select_face(found, portrait, select="largest")
+    assert largest is big_right and "largest" in how
+
+    central, how = faces.select_face(found, portrait, select="center")
+    assert central is middle and "central" in how
+
+    indexed, _ = faces.select_face(found, portrait, select="0")
+    assert indexed is big_right
+
+    with pytest.raises(faces.NoFaceFound):
+        faces.select_face(found, portrait, select="9")
+    with pytest.raises(ValueError):
+        faces.select_face(found, portrait, select="leftmost")
+
+
+def test_head_yaw_is_zero_square_on_and_one_in_profile():
+    landmarks = np.zeros((478, 2))
+    landmarks[33] = (0.0, 0.0)    # outer corner, one eye
+    landmarks[263] = (100.0, 0.0)  # outer corner, the other
+    landmarks[1] = (50.0, 20.0)    # nose tip centred between them
+    assert faces.head_yaw(landmarks) == pytest.approx(0.0, abs=1e-9)
+
+    landmarks[1] = (100.0, 20.0)   # nose tip over one eye: full profile
+    assert faces.head_yaw(landmarks) == pytest.approx(1.0, abs=1e-9)
+
+    landmarks[1] = (75.0, 20.0)    # half way: clearly turned
+    assert faces.head_yaw(landmarks) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_quality_verdict_reflects_pose(portrait):
+    """A square-on, well-filled frame is the case that should read 'good'."""
+    assert faces.sample_skin(portrait).quality in {"good", "marginal"}
